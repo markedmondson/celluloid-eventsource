@@ -2,13 +2,15 @@ require 'celluloid/current'
 require "celluloid/eventsource/version"
 require 'celluloid/io'
 require 'celluloid/eventsource/response_parser'
+require 'concurrent'
+require 'logger'
 require 'uri'
 
 module Celluloid
   class EventSource
     include Celluloid::IO
 
-    attr_reader :url, :with_credentials
+    attr_reader :url, :with_credentials, :heartbeat_timeout, :logger
     attr_reader :ready_state
 
     CONNECTING = 0
@@ -22,6 +24,9 @@ module Celluloid
       options  = options.dup
       @ready_state = CONNECTING
       @with_credentials = options.delete(:with_credentials) { false }
+      @heartbeat_timeout = options.delete(:heartbeat_timeout) { 300 }
+      @logger = options.delete(:logger) { default_logger }
+      @logger.info("[EventSource] Starting client connecting to url: #{self.url} with heartbeat timeout: #{@heartbeat_timeout} seconds")
       @headers = default_request_headers.merge(options.fetch(:headers, {}))
 
       @event_type_buffer = ""
@@ -58,14 +63,24 @@ module Celluloid
         begin
           establish_connection
           chunked? ? process_chunked_stream : process_stream
-        rescue
-          # Just reconnect
+        rescue Exception => e
+          logger.debug("[EventSource] Reconnecting after exception: #{e}")
         end
-        sleep @reconnect_timeout        
+        sleep @reconnect_timeout
       end
     end
 
+    def listen_for_heartbeats
+      @logger.debug("[EventSource] Starting listening for heartbeats. Reconnecting after #{@heartbeat_timeout} seconds if no comments are received")
+      @heartbeat_task = Concurrent::ScheduledTask.new(@heartbeat_timeout){
+        @logger.warn("[EventSource] Didn't get heartbeat after #{@heartbeat_timeout} seconds. Reconnecting.")
+        @socket.close if @socket
+      }.execute
+    end
+
     def close
+      @logger.info("[EventSource] Closing client")
+      @heartbeat_task.cancel if @heartbeat_task
       @socket.close if @socket
       @ready_state = CLOSED
     end
@@ -95,6 +110,7 @@ module Celluloid
     end
 
     def establish_connection
+      @logger.info("[EventSource] Connecting to url: #{@url}")
       @socket = Celluloid::IO::TCPSocket.new(@url.host, @url.port)
 
       if ssl?
@@ -108,6 +124,7 @@ module Celluloid
         @parser << @socket.readline
       end
 
+      logger.debug("[EventSource] Got status code: #{@parser.status_code}")
       if @parser.status_code != 200
         until @socket.eof?
           @parser << @socket.readline
@@ -176,14 +193,17 @@ module Celluloid
 
     def parse_line(line)
       case line
-      when /^:.*$/
-      when /^(\w+): ?(.*)$/
-        process_field($1, $2)
-      else
-        if chunked? && !@data_buffer.empty?
-          @data_buffer.rstrip!
-          process_field("data", line.rstrip)
-        end
+        when /^: ?(.*)$/
+          @logger.debug("[EventSource] Got comment: #{$1}")
+          @heartbeat_task.cancel if @heartbeat_task
+          listen_for_heartbeats
+        when /^(\w+): ?(.*)$/
+          process_field($1, $2)
+        else
+          if chunked? && !@data_buffer.empty?
+            @data_buffer.rstrip!
+            process_field("data", line.rstrip)
+          end
       end
     end
 
@@ -196,6 +216,7 @@ module Celluloid
       event = MessageEvent.new(:message, @data_buffer, @last_event_id)
       event.type = @event_type_buffer.to_sym unless @event_type_buffer.empty?
 
+      @logger.debug("[EventSource] Dispatching event: #{event}")
       dispatch_event(event)
     ensure
       clear_buffers!
@@ -221,6 +242,8 @@ module Celluloid
         @chunked = !headers["Transfer-Encoding"].nil? && headers["Transfer-Encoding"].include?("chunked")
         @ready_state = OPEN
         @on[:open].call
+        @heartbeat_task.cancel if @heartbeat_task
+        listen_for_heartbeats
       else
         close
         @on[:error].call({status_code: @parser.status_code, body: "Invalid Content-Type #{headers['Content-Type']}. Expected text/event-stream"})
@@ -231,6 +254,16 @@ module Celluloid
       headers = @headers.map { |k, v| "#{k}: #{v}" }
 
       ["GET #{url.request_uri} HTTP/1.1", headers].flatten.join("\r\n").concat("\r\n\r\n")
+    end
+
+    def default_logger
+      if defined?(Rails) && Rails.respond_to?(:logger)
+        Rails.logger
+      else
+        log = ::Logger.new($stdout)
+        log.level = ::Logger::INFO
+        log
+      end
     end
 
   end
