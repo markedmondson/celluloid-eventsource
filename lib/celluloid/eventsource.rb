@@ -77,6 +77,7 @@ module Celluloid
 
     def listen_for_heartbeats
       @logger.debug("[EventSource] Starting listening for heartbeats. Reconnecting after #{@heartbeat_timeout} seconds if no comments are received")
+      @heartbeat_task.cancel if @heartbeat_task
       @heartbeat_task = Concurrent::ScheduledTask.new(@heartbeat_timeout){
         @logger.warn("[EventSource] Didn't get heartbeat after #{@heartbeat_timeout} seconds. Reconnecting.")
         @socket.close if @socket
@@ -201,7 +202,6 @@ module Celluloid
       case line
         when /^: ?(.*)$/
           @logger.debug("[EventSource] Got comment: #{$1}")
-          @heartbeat_task.cancel if @heartbeat_task
           listen_for_heartbeats
         when /^(\w+): ?(.*)$/
           process_field($1, $2)
@@ -249,7 +249,6 @@ module Celluloid
         @ready_state = OPEN
         @on[:open].call
         @logger.info("[EventSource] Connected ok!")
-        @heartbeat_task.cancel if @heartbeat_task
         listen_for_heartbeats
       else
         @socket.close if @socket
