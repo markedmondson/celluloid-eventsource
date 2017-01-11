@@ -1,7 +1,7 @@
 require 'celluloid/current'
-require "celluloid/eventsource/version"
+require 'version'
 require 'celluloid/io'
-require 'celluloid/eventsource/response_parser'
+require 'response_parser'
 require 'concurrent'
 require 'logger'
 require 'retries'
