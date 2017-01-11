@@ -2,18 +2,25 @@ require 'celluloid/current'
 require "celluloid/eventsource/version"
 require 'celluloid/io'
 require 'celluloid/eventsource/response_parser'
+require 'concurrent'
+require 'logger'
+require 'retries'
 require 'uri'
 
 module Celluloid
   class EventSource
     include Celluloid::IO
 
-    attr_reader :url, :with_credentials
+    attr_reader :url, :with_credentials, :heartbeat_timeout, :logger
     attr_reader :ready_state
 
     CONNECTING = 0
     OPEN = 1
     CLOSED = 2
+
+    # 2^31 since our retries library doesn't allow for unlimited retries.
+    # At an average of 1 second per retry, we'll still be retrying in 68 years.
+    MAX_RETRIES = 2147483648
 
     execute_block_on_receiver :initialize
 
@@ -22,6 +29,9 @@ module Celluloid
       options  = options.dup
       @ready_state = CONNECTING
       @with_credentials = options.delete(:with_credentials) { false }
+      @heartbeat_timeout = options.delete(:heartbeat_timeout) { 300 }
+      @logger = options.delete(:logger) { default_logger }
+      @logger.info("[EventSource] Starting client connecting to url: #{self.url} with heartbeat timeout: #{@heartbeat_timeout} seconds")
       @headers = default_request_headers.merge(options.fetch(:headers, {}))
 
       @event_type_buffer = ""
@@ -31,7 +41,7 @@ module Celluloid
       @last_event_id = String.new
 
       @reconnect_timeout = 1
-      @on = { open: ->{}, message: ->(_) {}, error: ->(_) {} }
+      @on = { open: ->{}, message: ->(_) {}}
       @parser = ResponseParser.new
 
       @chunked = false
@@ -58,14 +68,25 @@ module Celluloid
         begin
           establish_connection
           chunked? ? process_chunked_stream : process_stream
-        rescue
-          # Just reconnect
+        rescue Exception => e
+          logger.debug("[EventSource] Reconnecting after exception: #{e}")
         end
-        sleep @reconnect_timeout        
+        sleep @reconnect_timeout
       end
     end
 
+    def listen_for_heartbeats
+      @logger.debug("[EventSource] Starting listening for heartbeats. Reconnecting after #{@heartbeat_timeout} seconds if no comments are received")
+      @heartbeat_task.cancel if @heartbeat_task
+      @heartbeat_task = Concurrent::ScheduledTask.new(@heartbeat_timeout){
+        @logger.warn("[EventSource] Didn't get heartbeat after #{@heartbeat_timeout} seconds. Reconnecting.")
+        @socket.close if @socket
+      }.execute
+    end
+
     def close
+      @logger.info("[EventSource] Closing client")
+      @heartbeat_task.cancel if @heartbeat_task
       @socket.close if @socket
       @ready_state = CLOSED
     end
@@ -82,10 +103,6 @@ module Celluloid
       @on[:message] = action
     end
 
-    def on_error(&action)
-      @on[:error] = action
-    end
-
     private
 
     MessageEvent = Struct.new(:type, :data, :last_event_id)
@@ -95,31 +112,38 @@ module Celluloid
     end
 
     def establish_connection
-      @socket = Celluloid::IO::TCPSocket.new(@url.host, @url.port)
-
-      if ssl?
-        @socket = Celluloid::IO::SSLSocket.new(@socket)
-        @socket.connect
+      handler = Proc.new do |exception, attempt_number, total_delay|
+        logger.warn("[EventSource] Could not connect with exception: #{exception.class} #{exception.message}; retry attempt #{attempt_number}; #{total_delay} seconds have passed.")
       end
 
-      @socket.write(request_string)
+      with_retries(:max_tries => MAX_RETRIES,
+                   :base_sleep_seconds => 1.0,
+                   :max_sleep_seconds => 30.0,
+                   :handler => handler,
+                   :rescue => Exception) do
+        if !closed?
+          @logger.info("[EventSource] Connecting to url: #{@url}")
+          @socket = Celluloid::IO::TCPSocket.new(@url.host, @url.port)
 
-      until @parser.headers?
-        @parser << @socket.readline
-      end
+          if ssl?
+            @socket = Celluloid::IO::SSLSocket.new(@socket)
+            @socket.connect
+          end
 
-      if @parser.status_code != 200
-        until @socket.eof?
-          @parser << @socket.readline
+          @socket.write(request_string)
+
+          until @parser.headers?
+            @parser << @socket.readline
+          end
+
+          if @parser.status_code != 200
+            @socket.close if @socket
+            raise "[EventSource] Could not connect to stream. Got status code: #{@parser.status_code}"
+          end
+
+          handle_headers(@parser.headers)
         end
-        # If the server returns a non-200, we don't want to close-- we just want to
-        # report an error
-        # close
-        @on[:error].call({status_code: @parser.status_code, body: @parser.chunk})
-        return
       end
-
-      handle_headers(@parser.headers)
     end
 
     def default_request_headers
@@ -176,14 +200,16 @@ module Celluloid
 
     def parse_line(line)
       case line
-      when /^:.*$/
-      when /^(\w+): ?(.*)$/
-        process_field($1, $2)
-      else
-        if chunked? && !@data_buffer.empty?
-          @data_buffer.rstrip!
-          process_field("data", line.rstrip)
-        end
+        when /^: ?(.*)$/
+          @logger.debug("[EventSource] Got comment: #{$1}")
+          listen_for_heartbeats
+        when /^(\w+): ?(.*)$/
+          process_field($1, $2)
+        else
+          if chunked? && !@data_buffer.empty?
+            @data_buffer.rstrip!
+            process_field("data", line.rstrip)
+          end
       end
     end
 
@@ -196,6 +222,7 @@ module Celluloid
       event = MessageEvent.new(:message, @data_buffer, @last_event_id)
       event.type = @event_type_buffer.to_sym unless @event_type_buffer.empty?
 
+      @logger.debug("[EventSource] Dispatching event: #{event}")
       dispatch_event(event)
     ensure
       clear_buffers!
@@ -221,9 +248,11 @@ module Celluloid
         @chunked = !headers["Transfer-Encoding"].nil? && headers["Transfer-Encoding"].include?("chunked")
         @ready_state = OPEN
         @on[:open].call
+        @logger.info("[EventSource] Connected ok!")
+        listen_for_heartbeats
       else
-        close
-        @on[:error].call({status_code: @parser.status_code, body: "Invalid Content-Type #{headers['Content-Type']}. Expected text/event-stream"})
+        @socket.close if @socket
+        raise "Got invalid Content-Type header: #{headers['Content-Type']}. Expected text/event-stream"
       end
     end
 
@@ -231,6 +260,16 @@ module Celluloid
       headers = @headers.map { |k, v| "#{k}: #{v}" }
 
       ["GET #{url.request_uri} HTTP/1.1", headers].flatten.join("\r\n").concat("\r\n\r\n")
+    end
+
+    def default_logger
+      if defined?(Rails) && Rails.respond_to?(:logger)
+        Rails.logger
+      else
+        log = ::Logger.new($stdout)
+        log.level = ::Logger::INFO
+        log
+      end
     end
 
   end
