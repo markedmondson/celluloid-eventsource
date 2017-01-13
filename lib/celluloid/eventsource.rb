@@ -41,7 +41,7 @@ module Celluloid
       @last_event_id = String.new
 
       @reconnect_timeout = 1
-      @on = { open: ->{}, message: ->(_) {}}
+      @on = { open: ->{}, message: ->(_) {}, error: ->(_) {}}
       @parser = ResponseParser.new
 
       @chunked = false
@@ -101,6 +101,10 @@ module Celluloid
 
     def on_message(&action)
       @on[:message] = action
+    end
+
+    def on_error(&action)
+      @on[:error] = action
     end
 
     private
