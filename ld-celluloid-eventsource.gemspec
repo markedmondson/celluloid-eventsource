@@ -1,7 +1,7 @@
 # coding: utf-8
 lib = File.expand_path('../lib', __FILE__)
 $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
-require 'ld_celluloid_eventsource/version'
+require 'celluloid/eventsource/version'
 
 Gem::Specification.new do |spec|
   spec.name          = "ld-celluloid-eventsource"
@@ -21,7 +21,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency 'celluloid-io', '~> 0.17.3'
   spec.add_dependency 'nio4r', '~> 1.1'
   spec.add_dependency 'http_parser.rb', '~> 0.6.0'
-  spec.add_dependency 'concurrent-ruby', '~> 1.0.4'
+  spec.add_dependency 'concurrent-ruby', '~> 1.0'
   spec.add_dependency 'retries', '~> 0.0.5'
 
   spec.add_development_dependency "rspec", '~> 3.0'
